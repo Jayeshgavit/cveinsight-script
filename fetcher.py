@@ -19,15 +19,23 @@ def _headers() -> dict:
     return {"apiKey": api_key} if api_key else {}
 
 
+def fetch_all_cves() -> list:
+    """Fetch ALL CVEs ever published in NVD (no date filter). Use for initial full load."""
+    logger.info("Fetching ALL CVEs from NVD (full historical load)...")
+    return _paginate(params_extra={})
+
+
 def fetch_cves(days: int = 7) -> list:
-    """Fetch CVEs published in the last `days` days from NVD. Returns list of raw cve dicts."""
+    """Fetch CVEs published in the last `days` days. Use for incremental updates."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
     pub_start = start.strftime("%Y-%m-%dT%H:%M:%S.000")
     pub_end = end.strftime("%Y-%m-%dT%H:%M:%S.000")
-
     logger.info(f"Fetching CVEs published between {pub_start} and {pub_end}")
+    return _paginate(params_extra={"pubStartDate": pub_start, "pubEndDate": pub_end})
 
+
+def _paginate(params_extra: dict) -> list:
     all_cves = []
     start_index = 0
     headers = _headers()
@@ -35,10 +43,9 @@ def fetch_cves(days: int = 7) -> list:
     with httpx.Client(timeout=60.0) as client:
         while True:
             params = {
-                "pubStartDate": pub_start,
-                "pubEndDate": pub_end,
                 "resultsPerPage": RESULTS_PER_PAGE,
                 "startIndex": start_index,
+                **params_extra,
             }
             logger.info(f"NVD request: startIndex={start_index}")
 
@@ -93,3 +100,24 @@ def _get_with_retry(client: httpx.Client, params: dict, headers: dict):
 
     logger.error(f"NVD unexpected status {response.status_code}. Skipping page.")
     return None
+
+def fetch_cves_historical(start_index: int = 0) -> tuple[list, int]:
+    """Fetch historical CVEs starting from a specific index without date filters."""
+    logger.info(f"Fetching historical CVEs starting from index {start_index}")
+    headers = _headers()
+    
+    with httpx.Client(timeout=60.0) as client:
+        params = {
+            "resultsPerPage": RESULTS_PER_PAGE,
+            "startIndex": start_index,
+        }
+        response = _get_with_retry(client, params, headers)
+        if not response:
+            return [], 0
+            
+        data = response.json()
+        total = data.get("totalResults", 0)
+        vulnerabilities = data.get("vulnerabilities", [])
+        
+        cves = [item["cve"] for item in vulnerabilities]
+        return cves, total

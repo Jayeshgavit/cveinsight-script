@@ -9,6 +9,8 @@ load_dotenv()
 
 logger = logging.getLogger("cveinsight")
 
+CHUNK_SIZE = 500  # rows per batch insert
+
 _client: Client = None
 
 
@@ -26,67 +28,151 @@ def is_first_run() -> bool:
     return len(result.data) == 0
 
 
+def get_existing_cve_ids(cve_ids: list) -> set:
+    """
+    1 DB query per 500 IDs — returns set of cve_id strings already in DB.
+    Handles any number of IDs by chunking.
+    """
+    if not cve_ids:
+        return set()
+    existing = set()
+    for i in range(0, len(cve_ids), CHUNK_SIZE):
+        chunk = cve_ids[i: i + CHUNK_SIZE]
+        try:
+            result = get_client().table("cves").select("cve_id").in_("cve_id", chunk).execute()
+            existing.update(row["cve_id"] for row in result.data)
+        except Exception as e:
+            logger.error(f"Failed to batch check existing CVE IDs (chunk {i}): {e}")
+    return existing
+
+
+def insert_cves_batch(records: list) -> dict:
+    """
+    Bulk insert CVE records in chunks of CHUNK_SIZE.
+    Returns {cve_id: uuid} map for all successfully inserted rows.
+    Skips duplicates silently (already filtered before calling this).
+    """
+    uuid_map = {}
+    for i in range(0, len(records), CHUNK_SIZE):
+        chunk = records[i: i + CHUNK_SIZE]
+        try:
+            result = get_client().table("cves").insert(chunk).execute()
+            for row in result.data:
+                uuid_map[row["cve_id"]] = row["id"]
+            logger.info(f"CVEs inserted: {len(uuid_map)}/{len(records)}")
+        except Exception as e:
+            logger.error(f"Failed to bulk insert CVE chunk {i}–{i + len(chunk)}: {e}")
+    return uuid_map
+
+
+def upsert_software_bulk(software_list: list) -> dict:
+    """
+    Bulk upsert all unique software rows in chunks.
+    Returns {vendor|product: id} map.
+    """
+    if not software_list:
+        return {}
+    # Deduplicate before sending
+    seen = set()
+    unique_rows = []
+    for s in software_list:
+        key = f"{s['vendor']}|{s['product']}"
+        if key not in seen:
+            seen.add(key)
+            unique_rows.append({"vendor": s["vendor"], "product": s["product"], "ecosystem": s["ecosystem"]})
+
+    id_map = {}
+    for i in range(0, len(unique_rows), CHUNK_SIZE):
+        chunk = unique_rows[i: i + CHUNK_SIZE]
+        try:
+            result = (
+                get_client()
+                .table("software")
+                .upsert(chunk, on_conflict="vendor,product")
+                .execute()
+            )
+            for r in result.data:
+                id_map[f"{r['vendor']}|{r['product']}"] = r["id"]
+        except Exception as e:
+            logger.error(f"Failed to bulk upsert software chunk {i}: {e}")
+    return id_map
+
+
+def insert_affected_software_bulk(rows: list) -> None:
+    """Bulk insert cve_affected_software rows in chunks."""
+    for i in range(0, len(rows), CHUNK_SIZE):
+        chunk = rows[i: i + CHUNK_SIZE]
+        try:
+            get_client().table("cve_affected_software").insert(chunk).execute()
+        except Exception as e:
+            logger.error(f"Failed to bulk insert affected software chunk {i}: {e}")
+
+
+def insert_references_bulk(rows: list) -> None:
+    """Bulk insert cve_references rows in chunks."""
+    for i in range(0, len(rows), CHUNK_SIZE):
+        chunk = rows[i: i + CHUNK_SIZE]
+        try:
+            get_client().table("cve_references").insert(chunk).execute()
+        except Exception as e:
+            logger.error(f"Failed to bulk insert references chunk {i}: {e}")
+
+
+# ── AI insights helpers ──────────────────────────────────────────────────────
+
+def get_all_insight_cve_ids() -> set:
+    """Return set of all cve UUIDs that already have AI insights. Paginated for large tables."""
+    done = set()
+    offset = 0
+    while True:
+        result = (
+            get_client()
+            .table("cve_ai_insights")
+            .select("cve_id")
+            .limit(1000)
+            .offset(offset)
+            .execute()
+        )
+        for row in result.data:
+            done.add(row["cve_id"])
+        if len(result.data) < 1000:
+            break
+        offset += 1000
+    return done
+
+
+def get_cves_for_year(year: int, done_ids: set, batch_size: int = 50, offset: int = 0) -> list:
+    """Fetch CVEs for a year not in done_ids, ordered newest first. Filters client-side."""
+    result = (
+        get_client()
+        .table("cves")
+        .select("id, cve_id, description, cvss_score, severity, attack_vector")
+        .gte("published_at", f"{year}-01-01")
+        .lte("published_at", f"{year}-12-31")
+        .order("published_at", desc=True)
+        .limit(batch_size)
+        .offset(offset)
+        .execute()
+    )
+    if done_ids:
+        return [r for r in result.data if r["id"] not in done_ids]
+    return result.data
+
+
+# ── kept for single-CVE operations ───────────────────────────────────────────
+
 def cve_exists(cve_id: str) -> bool:
     result = get_client().table("cves").select("id").eq("cve_id", cve_id).execute()
     return len(result.data) > 0
 
 
 def insert_cve(cve_data: dict) -> str | None:
-    """Insert a CVE row and return its uuid, or None on failure."""
     try:
         result = get_client().table("cves").insert(cve_data).execute()
         return result.data[0]["id"]
     except Exception as e:
         logger.error(f"Failed to insert CVE {cve_data.get('cve_id')}: {e}")
         return None
-
-
-def upsert_software(vendor: str, product: str, ecosystem: str) -> str | None:
-    """Upsert a software row and return its uuid."""
-    try:
-        result = (
-            get_client()
-            .table("software")
-            .upsert(
-                {"vendor": vendor, "product": product, "ecosystem": ecosystem},
-                on_conflict="vendor,product",
-            )
-            .execute()
-        )
-        return result.data[0]["id"]
-    except Exception as e:
-        logger.error(f"Failed to upsert software {vendor}/{product}: {e}")
-        return None
-
-
-def insert_affected_software(
-    cve_uuid: str,
-    software_id: str,
-    version_start: str | None,
-    version_end: str | None,
-    fixed_version: str | None,
-) -> None:
-    try:
-        get_client().table("cve_affected_software").insert({
-            "cve_id": cve_uuid,
-            "software_id": software_id,
-            "version_start": version_start,
-            "version_end": version_end,
-            "fixed_version": fixed_version,
-            "status": "affected",
-        }).execute()
-    except Exception as e:
-        logger.error(f"Failed to insert affected software for CVE {cve_uuid}: {e}")
-
-
-def insert_references(cve_uuid: str, references: list) -> None:
-    if not references:
-        return
-    rows = [{"cve_id": cve_uuid, **ref} for ref in references]
-    try:
-        get_client().table("cve_references").insert(rows).execute()
-    except Exception as e:
-        logger.error(f"Failed to insert references for CVE {cve_uuid}: {e}")
 
 
 def ai_insights_exist(cve_uuid: str) -> bool:
@@ -103,7 +189,7 @@ def insert_ai_insights(cve_uuid: str, insights: dict) -> None:
             "plain_english": insights.get("plain_english"),
             "fix_steps": insights.get("fix_steps"),
             "risk_summary": insights.get("risk_summary"),
-            "model_used": "gemini-1.5-flash",
+            "model_used": "llama-3.3-70b-versatile",
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:
@@ -111,7 +197,6 @@ def insert_ai_insights(cve_uuid: str, insights: dict) -> None:
 
 
 def get_cves_sharing_software(cve_uuid: str) -> list:
-    """Return uuids of other CVEs that share affected software with this CVE."""
     try:
         sw_result = (
             get_client()

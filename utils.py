@@ -1,13 +1,17 @@
 import logging
-import sys
+
+from rich.console import Console
+from rich.logging import RichHandler
+
+console = Console()
 
 
 def setup_logging() -> logging.Logger:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        format="%(message)s",
+        datefmt="[%H:%M:%S]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False)],
     )
     return logging.getLogger("cveinsight")
 

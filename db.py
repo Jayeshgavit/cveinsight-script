@@ -141,8 +141,8 @@ def get_all_insight_cve_ids() -> set:
     return done
 
 
-def get_cves_for_year(year: int, done_ids: set, batch_size: int = 50, offset: int = 0) -> list:
-    """Fetch CVEs for a year not in done_ids, ordered newest first. Filters client-side."""
+def get_cves_for_year(year: int, batch_size: int = 50, offset: int = 0) -> list:
+    """Fetch a page of CVEs for a year, ordered newest first. Filtering is done client-side in ai_step."""
     result = (
         get_client()
         .table("cves")
@@ -154,8 +154,6 @@ def get_cves_for_year(year: int, done_ids: set, batch_size: int = 50, offset: in
         .offset(offset)
         .execute()
     )
-    if done_ids:
-        return [r for r in result.data if r["id"] not in done_ids]
     return result.data
 
 
@@ -182,14 +180,14 @@ def ai_insights_exist(cve_uuid: str) -> bool:
     return len(result.data) > 0
 
 
-def insert_ai_insights(cve_uuid: str, insights: dict) -> None:
+def insert_ai_insights(cve_uuid: str, insights: dict, model_used: str = "llama-3.3-70b-versatile") -> None:
     try:
         get_client().table("cve_ai_insights").insert({
             "cve_id": cve_uuid,
             "plain_english": insights.get("plain_english"),
             "fix_steps": insights.get("fix_steps"),
             "risk_summary": insights.get("risk_summary"),
-            "model_used": "llama-3.3-70b-versatile",
+            "model_used": model_used,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }).execute()
     except Exception as e:

@@ -3,8 +3,9 @@
 ## Project Overview
 CVEInsight is a cybersecurity vulnerability platform that fetches CVE data from
 the National Vulnerability Database (NVD), enriches it with AI-generated plain
-English explanations using Gemini, and stores everything in Supabase. The React
-frontend (built separately) reads directly from Supabase.
+English explanations using Groq (primary) or Gemini (fallback), and stores
+everything in Supabase. The React frontend (built separately) reads directly
+from Supabase.
 
 This repo contains ONLY the backend data pipeline. No frontend code here.
 
@@ -21,7 +22,8 @@ cveinsight-script/
 ├── main.py                      ← entry point, runs full pipeline once
 ├── scheduler.py                 ← runs main.py every 6 hours
 ├── fetcher.py                   ← hits NVD API, returns raw CVE data
-├── ai_processor.py              ← sends CVE to Gemini, returns insights
+├── ai_processor.py              ← sends CVEs to Groq/Gemini, returns insights
+├── ai_step.py                   ← standalone backfill: adds AI insights to existing CVEs
 ├── db.py                        ← all Supabase read/write operations
 ├── utils.py                     ← shared helpers (logging, parsing)
 └── .github/
@@ -36,10 +38,12 @@ cveinsight-script/
 - **Database**: Supabase (PostgreSQL under the hood)
 - **Supabase client**: `supabase-py`
 - **NVD API**: REST, v2, no auth needed but API key removes rate limits
-- **AI**: Google Gemini 1.5 Flash (free tier) via `google-generativeai`
+- **AI (primary)**: Groq `llama-3.3-70b-versatile` via OpenAI-compatible API (`openai` SDK)
+- **AI (fallback)**: Google Gemini `gemini-2.5-flash` via `google-genai` SDK
 - **Scheduler**: GitHub Actions (free, runs every 6 hours)
 - **HTTP**: `httpx` (async-friendly, better than requests)
 - **Env vars**: `python-dotenv`
+- **UI/logging**: `rich` (progress bars, panels)
 
 ---
 
@@ -101,7 +105,7 @@ cve_id uuid FK → cves.id
 plain_english text          -- what this CVE means in simple words
 fix_steps text              -- step by step how to fix it
 risk_summary text           -- one line risk summary
-model_used text             -- default 'gemini-1.5-flash'
+model_used text             -- e.g. 'llama-3.3-70b-versatile' or 'gemini-2.5-flash'
 generated_at timestamp
 ```
 
@@ -121,10 +125,11 @@ UNIQUE(cve_id, related_cve_id)
 SUPABASE_URL=https://xxxx.supabase.co
 SUPABASE_SERVICE_KEY=your_service_role_key
 NVD_API_KEY=your_nvd_api_key
+GROQ_API_KEY=your_groq_api_key
 GEMINI_API_KEY=your_gemini_api_key
 ```
 
-For GitHub Actions, all 4 go into repo Settings → Secrets → Actions.
+For GitHub Actions, all 5 go into repo Settings → Secrets → Actions.
 
 ---
 
@@ -191,30 +196,46 @@ For GitHub Actions, all 4 go into repo Settings → Secrets → Actions.
 
 ---
 
-## AI Processor — Gemini Prompt Pattern
+## AI Processor — Prompt Pattern (Groq + Gemini)
 
-Send this to Gemini for each CVE:
+`ai_processor.py` batches multiple CVEs per API call (default 5 via `ai_step.py`).
+Groq is tried first; on rate-limit (429) it immediately falls back to Gemini.
+The active provider is tracked in `_active_provider` and resets to Groq between runs.
+
+Send this batch prompt to the active provider:
 
 ```
-You are a cybersecurity expert. Given this CVE data, respond ONLY in JSON.
+You are a cybersecurity expert. I will give you N CVEs.
+Respond ONLY with a JSON array — one object per CVE, in the same order.
 
-CVE ID: {cve_id}
-Description: {description}
-CVSS Score: {cvss_score}
-Severity: {severity}
-Attack Vector: {attack_vector}
+CVEs:
+[
+  {"cve_id": "...", "description": "...", "cvss_score": ..., "severity": "...", "attack_vector": "..."},
+  ...
+]
 
-Return exactly this JSON structure:
+Return a JSON array where each element has exactly these fields:
 {
+  "cve_id": "the CVE ID from input",
   "plain_english": "2-3 sentence explanation a developer can understand",
   "fix_steps": "numbered steps to fix or mitigate this vulnerability",
   "risk_summary": "one sentence: who is at risk and how serious"
 }
+
+Return ONLY the JSON array. No markdown, no explanation.
 ```
 
-Parse the JSON response and store each field separately in `cve_ai_insights`.
-If Gemini fails or returns invalid JSON, store null for that CVE and log the error.
+Parse the JSON array response and store each field in `cve_ai_insights` with the
+`model_used` field set to the model string that produced the result.
+If either provider fails or returns invalid JSON, log the error and return empty dict.
 Never crash the pipeline because of one AI failure.
+
+### `ai_step.py` — Standalone AI Backfill
+- Iterates years from current year down to 1999
+- Fetches CVEs from DB that have no insights (`get_cves_for_year` + `get_all_insight_cve_ids`)
+- Sends in batches of 5 CVEs per API call, 12s delay between calls (Groq free tier)
+- Stops a year after 5 consecutive total-failure batches
+- Run directly: `python ai_step.py`
 
 ---
 
@@ -222,7 +243,7 @@ Never crash the pipeline because of one AI failure.
 - If NVD API returns 403 → log and stop (API key issue)
 - If NVD API returns 503 → wait 60 seconds, retry once
 - If a single CVE insert fails → log it, skip it, continue pipeline
-- If Gemini fails for a CVE → insert CVE anyway, leave ai_insights null
+- If both Groq and Gemini fail for a CVE → insert CVE anyway, leave ai_insights null
 - If Supabase insert fails → log full error with cve_id, continue
 - Never let one bad CVE crash the whole run
 - At the end of every run, print a summary: total fetched / inserted / skipped / failed
@@ -236,7 +257,7 @@ File: `.github/workflows/fetch_cves.yml`
 - Runner: `ubuntu-latest`
 - Python version: `3.11`
 - Steps: checkout → setup python → install requirements → run `python main.py`
-- Secrets used: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `NVD_API_KEY`, `GEMINI_API_KEY`
+- Secrets used: `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `NVD_API_KEY`, `GROQ_API_KEY`, `GEMINI_API_KEY`
 
 ---
 
@@ -246,7 +267,8 @@ File: `.github/workflows/fetch_cves.yml`
 - Always use `python-dotenv` to load `.env`
 - All Supabase operations go in `db.py` only — other files import from db.py
 - All NVD fetch logic goes in `fetcher.py` only
-- All Gemini logic goes in `ai_processor.py` only
+- All AI provider logic (Groq + Gemini) goes in `ai_processor.py` only
+- AI backfill orchestration goes in `ai_step.py` only
 - `main.py` just orchestrates — it imports and calls the others
 - Log every major step with timestamp using Python `logging` module
 - On first run, fetch last 30 days of CVEs to populate the DB
@@ -261,6 +283,6 @@ File: `.github/workflows/fetch_cves.yml`
 - Do not hardcode any API keys or URLs
 - Do not commit `.env` file
 - Do not recreate Supabase tables (schema already exists)
-- Do not call Gemini for CVEs that already have ai_insights
+- Do not call Groq or Gemini for CVEs that already have ai_insights
 - Do not fetch all CVEs from the beginning every run (too slow, hits rate limits)
 - Do not use `print()` for logging (use Python `logging` module)

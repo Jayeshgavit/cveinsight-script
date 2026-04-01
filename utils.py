@@ -23,6 +23,16 @@ def parse_description(cve: dict) -> str:
     return ""
 
 
+def parse_title(description: str, max_len: int = 150) -> str:
+    """Derive a title from the first sentence of the CVE description."""
+    if not description:
+        return ""
+    sentence = description.split(". ")[0].rstrip(".")
+    if len(sentence) > max_len:
+        sentence = sentence[:max_len].rsplit(" ", 1)[0] + "…"
+    return sentence
+
+
 def parse_cvss_metrics(cve: dict) -> dict:
     metrics = cve.get("metrics", {})
 

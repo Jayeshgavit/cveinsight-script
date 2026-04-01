@@ -22,6 +22,7 @@ from utils import (
     parse_cvss_metrics,
     parse_description,
     parse_references,
+    parse_title,
     setup_logging,
 )
 
@@ -99,7 +100,7 @@ def run_pipeline() -> None:
 
             cve_records.append({
                 "cve_id": cve_id,
-                "title": cve_id,
+                "title": parse_title(description),
                 "description": description,
                 "severity": metrics["severity"],
                 "cvss_score": metrics["cvss_score"],

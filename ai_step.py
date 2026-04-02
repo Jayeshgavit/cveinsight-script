@@ -164,5 +164,28 @@ def run_ai_step() -> None:
     logger.info(f"  Total failed    : {total_failed}")
 
 
+def run_ai_for_cves(cves: list) -> tuple[int, int]:
+    """
+    Process a given list of CVE dicts through Groq/Gemini in batches.
+    Used by main.py to generate AI insights for newly inserted CVEs.
+    Each dict must have: id, cve_id, description, cvss_score, severity, attack_vector.
+    Returns (processed, failed).
+    """
+    logger = logging.getLogger("cveinsight")
+    total_processed = 0
+    total_failed = 0
+
+    batches = [cves[i: i + AI_BATCH] for i in range(0, len(cves), AI_BATCH)]
+    for idx, batch in enumerate(batches):
+        p, f, _ = run_ai_for_batch(batch)
+        total_processed += p
+        total_failed += f
+        if idx < len(batches) - 1:
+            time.sleep(RATE_DELAY)
+
+    logger.info(f"run_ai_for_cves: {total_processed} saved, {total_failed} failed")
+    return total_processed, total_failed
+
+
 if __name__ == "__main__":
     run_ai_step()

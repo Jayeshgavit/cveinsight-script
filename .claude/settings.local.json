@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "WebFetch(domain:ai.google.dev)",
-      "Bash(venv/Scripts/pip install:*)"
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(grep -h \"^import\\\\|^from\" *.py)",
+      "Bash(venv/Scripts/pip freeze:*)",
+      "Bash(venv/bin/pip freeze:*)"
     ]
   }
 }
